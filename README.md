@@ -19,6 +19,152 @@ Validated on the development unit with:
 
 ESPHome 2026.8.2 or newer is required.
 
+> Hardware photos, PCB photos and the programming-pad pinout will be added later.
+
+## How the stock power-monitor bridge works
+
+The ESP8266 does **not** measure mains voltage/current directly and does not talk
+directly to the metering IC. The original WiOn design contains a separate stock
+power-monitor bridge between the mains metering circuitry and the ESP8266.
+
+The ESP8266 clocks the bridge on GPIO0 and reads data on GPIO12. A valid measurement
+frame contains four 32-bit words in this order:
+
+```text
+48xxxxxx  49xxxxxx  57xxxxxx  56xxxxxx
+    H         I         W         V
+```
+
+The upper byte is a tag; the lower 24 bits are the measurement payload:
+
+| Tag | Field | Meaning |
+|---|---|---|
+| `0x48` | `H` | Energy increment / accumulation input |
+| `0x49` | `I` | Current |
+| `0x57` | `W` | Active power |
+| `0x56` | `V` | Voltage |
+
+The firmware keeps the original bridge intact and converts these raw values instead
+of bypassing the bridge or rewiring the metering section.
+
+The stock conversion equations recovered during reverse engineering are:
+
+```text
+Voltage [V] = 100000000000 / (RawV × V_OFFSET)
+
+Current_factory [A] = 1000000000 / (RawI × A_OFFSET)
+
+Power [W] = 1000000000000 / (RawW × W_OFFSET)
+
+Energy_uncalibrated [kWh] =
+    sum(RawH) × 100 / HW_OFFSET
+```
+
+ESPHome then applies the user calibration. Current additionally uses the calibrated
+no-load offset:
+
+```text
+I_final = max(0, (I_factory - I_zero) × current_gain)
+```
+
+There is no wide low-current deadband or hysteresis.
+
+## Factory calibration data — back up the original flash first
+
+> **Important: make a full backup of the original 1 MiB flash before erasing or
+> flashing ESPHome.**
+>
+> The stock firmware contains the factory conversion constants used by the
+> power-monitor bridge. It is not yet known whether these constants are identical
+> across every WiOn 50055 or individually calibrated at the factory. Once the stock
+> flash has been erased, the original values cannot be recovered unless a backup
+> was made first.
+
+Create **two** independent dumps before changing the device:
+
+```powershell
+python -m esptool --chip esp8266 --port COM19 read-flash 0x000000 0x100000 wion_original_1.bin
+python -m esptool --chip esp8266 --port COM19 read-flash 0x000000 0x100000 wion_original_2.bin
+
+Get-FileHash .\wion_original_1.bin -Algorithm SHA256
+Get-FileHash .\wion_original_2.bin -Algorithm SHA256
+```
+
+Replace `COM19` with the actual serial port. The two SHA256 hashes should match.
+
+For the development unit, both original dumps were identical:
+
+```text
+SHA256
+7AB8DFA85F3D397D4D9EF0C00C8AE22F5BD2B287C7B2D5F9D11DD9D2D838029D
+```
+
+### Factory calibration table in the verified stock dump
+
+In the verified 1 MiB stock image, a contiguous 16-byte little-endian table starts
+at flash offset `0x07D228`:
+
+| Flash offset | Name | 32-bit LE bytes | Decimal value |
+|---:|---|---|---:|
+| `0x07D228` | `HW_OFFSET` | `54 3C 30 05` | `87047252` |
+| `0x07D22C` | `A_OFFSET` | `2E 1D 02 00` | `138542` |
+| `0x07D230` | `W_OFFSET` | `EA 67 03 00` | `223210` |
+| `0x07D234` | `V_OFFSET` | `14 B6 04 00` | `308756` |
+
+These offsets are **verified for the stock firmware image above**. A different stock
+firmware revision may place the table elsewhere, so keep the full dump even if the
+values at these addresses look plausible.
+
+`HW_OFFSET` also occurs elsewhere in the stock image at `0x00E124`; that occurrence
+is not part of the contiguous calibration table. Use the four-value block beginning
+at `0x07D228`.
+
+You can extract the table directly from a backup with Python:
+
+```powershell
+@'
+from pathlib import Path
+import struct
+
+data = Path("wion_original_1.bin").read_bytes()
+
+for name, offset in {
+    "HW_OFFSET": 0x07D228,
+    "A_OFFSET":  0x07D22C,
+    "W_OFFSET":  0x07D230,
+    "V_OFFSET":  0x07D234,
+}.items():
+    value = struct.unpack_from("<I", data, offset)[0]
+    print(f"{name:9s}  0x{offset:06X}  {value}")
+'@ | python -
+```
+
+Expected output for the development unit:
+
+```text
+HW_OFFSET  0x07D228  87047252
+A_OFFSET   0x07D22C  138542
+W_OFFSET   0x07D230  223210
+V_OFFSET   0x07D234  308756
+```
+
+### Using another WiOn 50055
+
+Before flashing another unit:
+
+1. Back up the entire original 1 MiB flash twice.
+2. Compare the two SHA256 hashes.
+3. Extract the four stock constants from the backup.
+4. Compare them with the values above.
+5. If they differ, edit the corresponding `HW_OFFSET`, `A_OFFSET`, `W_OFFSET` and
+   `V_OFFSET` constants in `wion_50055_v1.0.0.yaml` **before flashing that unit**.
+6. After ESPHome is running, perform the normal zero/current/power/energy calibration
+   from the local web interface.
+
+The current v1.0.0 firmware uses the factory constants recovered from the development
+unit as its defaults. Until multiple original units have been compared, preserving
+the stock dump is strongly recommended.
+
 ## Main features
 
 - Home Assistant native encrypted API
@@ -85,12 +231,16 @@ calculation. `Average Power` derives active power from the H-channel over about
 
 Current uses a calibrated offset:
 
-`I_final = max(0, (I_factory - I_zero) * current_gain)`
+```text
+I_final = max(0, (I_factory - I_zero) × current_gain)
+```
 
 There is no wide current deadband or hysteresis, so small real loads are not
 intentionally discarded.
 
 ## Build
+
+Copy `secrets.example.yaml` to `secrets.yaml` and replace all example credentials.
 
 Keep these files together:
 
