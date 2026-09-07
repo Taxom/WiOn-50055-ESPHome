@@ -1,0 +1,8 @@
+secrets.yaml
+.esphome/
+build/
+.pio/
+.pioenvs/
+*.bin
+*.elf
+*.map

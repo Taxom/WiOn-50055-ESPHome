@@ -1,0 +1,927 @@
+substitutions:
+  device_name: wion-50055
+  friendly_name: "WiOn 50055"
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  comment: "ESPHome v1.0.0 firmware for Woods WiOn 50055 using the stock power-monitor bridge"
+  min_version: 2026.8.2
+  includes:
+    - wion_power_bridge.h
+  on_boot:
+    - priority: 600
+      then:
+        - lambda: |-
+            wion_bus_setup();
+
+    # Apply the user-selected outlet startup policy only after components and
+    # restored preferences are available. The relay itself always initializes
+    # physically OFF first, preventing an early ON pulse.
+    - priority: -100
+      then:
+        - lambda: |-
+            bool desired = false;
+            if (id(startup_mode_code) == 1) {
+              desired = true;                       // Always On
+            } else if (id(startup_mode_code) == 2) {
+              desired = id(last_outlet_state);      // Restore Last State
+            }
+
+            if (desired) {
+              id(outlet_relay).turn_on();
+            } else {
+              id(outlet_relay).turn_off();
+            }
+
+            id(boot_initializing) = false;
+
+            const String rr = ESP.getResetReason();
+            id(reset_reason).publish_state(rr.c_str());
+            ESP_LOGI("wion.boot", "Reset reason: %s", rr.c_str());
+
+esp8266:
+  board: esp01_1m
+  # Persist only ESPHome preferences that explicitly request restore_value.
+  # Energy / average-power accumulators below remain RAM-only.
+  restore_from_flash: true
+
+# Persist explicit user changes immediately.  No periodic energy checkpointing
+# is used, so flash writes are limited to calibration/settings and, when
+# selected, outlet-state changes for "Restore Last State".
+preferences:
+  flash_write_interval: 1s
+
+logger:
+  level: DEBUG
+  baud_rate: 0
+
+# -----------------------------------------------------------------------------
+# Network / recovery
+# -----------------------------------------------------------------------------
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  min_auth_mode: WPA2
+  power_save_mode: none
+  reboot_timeout: 0s
+
+  ap:
+    ssid: "WiOn-50055 Setup"
+    password: !secret fallback_ap_password
+    ap_timeout: 90s
+
+  on_connect:
+    - output.turn_on: blue_led_output
+  on_disconnect:
+    - output.turn_off: blue_led_output
+
+captive_portal:
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+  reboot_timeout: 0s
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+safe_mode:
+  num_attempts: 5
+  boot_is_good_after: 1min
+  reboot_timeout: 10min
+  storage: rtc
+
+web_server:
+  port: 80
+  version: 2
+  log: true
+  include_internal: true
+  auth:
+    type: digest
+    username: !secret web_username
+    password: !secret web_password
+
+# -----------------------------------------------------------------------------
+# Hardware I/O
+# -----------------------------------------------------------------------------
+
+output:
+  - platform: gpio
+    id: blue_led_output
+    pin:
+      number: GPIO2
+      inverted: true
+
+switch:
+  - platform: gpio
+    id: outlet_relay
+    name: "Outlet"
+    pin: GPIO15
+    restore_mode: ALWAYS_OFF
+
+    on_turn_on:
+      - lambda: |-
+          if (!id(boot_initializing) && id(startup_mode_code) == 2)
+            id(last_outlet_state) = true;
+
+          if (id(zero_cal_pending)) {
+            id(zero_cal_pending) = false;
+            id(zero_calibration_status).publish_state("Cancelled: outlet turned ON");
+            ESP_LOGW("wion", "Zero calibration cancelled because outlet was turned ON");
+          }
+
+    on_turn_off:
+      - lambda: |-
+          if (!id(boot_initializing) && id(startup_mode_code) == 2)
+            id(last_outlet_state) = false;
+
+  - platform: gpio
+    id: outlet_backlight
+    name: "Outlet Backlight"
+    pin: GPIO14
+    restore_mode: RESTORE_DEFAULT_OFF
+
+binary_sensor:
+  - platform: gpio
+    id: physical_button
+    name: "Physical Button"
+    internal: true
+    pin:
+      number: GPIO13
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    filters:
+      - delayed_on_off: 20ms
+
+    on_multi_click:
+      # Normal short press: toggle the outlet.
+      - timing:
+          - ON for at most 1s
+          - OFF for at least 50ms
+        then:
+          - switch.toggle: outlet_relay
+
+      # Service action: hold for 30 s to force the password-protected setup AP.
+      - timing:
+          - ON for at least 30s
+        then:
+          - script.execute: start_wifi_setup_ap
+
+# -----------------------------------------------------------------------------
+# Wi-Fi setup AP action
+# -----------------------------------------------------------------------------
+
+script:
+  - id: start_wifi_setup_ap
+    mode: restart
+    then:
+      - logger.log:
+          level: WARN
+          format: "Starting forced Wi-Fi setup AP; normal STA config will return after reboot"
+      - lambda: |-
+          auto *wifi_comp = esphome::wifi::global_wifi_component;
+          if (wifi_comp != nullptr) {
+            // Runtime-only change: the compiled STA credentials remain intact
+            // and are restored on the next reboot. With no STA configured and
+            // a fallback AP present, ESPHome starts AP-only + captive portal.
+            wifi_comp->disable();
+            wifi_comp->clear_sta();
+            wifi_comp->set_ap_timeout(0);
+            wifi_comp->enable();
+          }
+
+# -----------------------------------------------------------------------------
+# Outlet startup mode
+# -----------------------------------------------------------------------------
+
+select:
+  - platform: template
+    id: outlet_startup_mode
+    name: "Power Restore Mode"
+    entity_category: config
+    options:
+      - "Always Off"
+      - "Always On"
+      - "Restore Last State"
+    update_interval: 30s
+    lambda: |-
+      if (id(startup_mode_code) == 1)
+        return std::string("Always On");
+      if (id(startup_mode_code) == 2)
+        return std::string("Restore Last State");
+      return std::string("Always Off");
+    set_action:
+      - lambda: |-
+          if (x == "Always On") {
+            id(startup_mode_code) = 1;
+          } else if (x == "Restore Last State") {
+            id(startup_mode_code) = 2;
+            id(last_outlet_state) = id(outlet_relay).state;
+          } else {
+            id(startup_mode_code) = 0;
+          }
+          id(outlet_startup_mode).publish_state(x);
+
+# -----------------------------------------------------------------------------
+# Persistent runtime state
+# -----------------------------------------------------------------------------
+
+globals:
+  # Startup behavior: 0=Always Off, 1=Always On, 2=Restore Last State.
+  - id: startup_mode_code
+    type: uint8_t
+    restore_value: yes
+    initial_value: '0'
+
+  - id: last_outlet_state
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+
+  - id: boot_initializing
+    type: bool
+    restore_value: no
+    initial_value: 'true'
+
+  # Device-specific calibration gains. These defaults come from the measurements
+  # made on this exact plug and can be recalibrated from the local web UI.
+  - id: voltage_gain
+    type: double
+    restore_value: yes
+    initial_value: '1.0'
+
+  - id: current_gain
+    type: double
+    restore_value: yes
+    initial_value: '1.041415'
+
+  - id: power_gain
+    type: double
+    restore_value: yes
+    initial_value: '1.031'
+
+  - id: energy_gain
+    type: double
+    restore_value: yes
+    initial_value: '1.138468'
+
+  # Last uncalibrated factory-converted measurements for reference calibration.
+  # Main HA energy counter: deliberately RAM-only. It resets on device reboot;
+  # state_class=total_increasing lets HA account for such resets correctly.
+  - id: energy_total_raw
+    type: uint64_t
+    restore_value: no
+    initial_value: '0'
+
+  # Separate raw accumulator used only when calibrating energy.
+  - id: energy_cal_raw
+    type: uint64_t
+    restore_value: no
+    initial_value: '0'
+
+  # 60-second active-power estimator derived from the H/energy channel.
+  # This remains RAM-only and exists specifically to resolve very small loads
+  # that the instantaneous W channel reports as zero.
+  - id: average_power_raw
+    type: uint64_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: average_power_window_start_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  # Persisted raw no-load current calibration point (converted to an offset at runtime).
+  - id: current_zero_raw
+    type: uint32_t
+    restore_value: yes
+    initial_value: '443876'
+
+  - id: zero_cal_pending
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: zero_cal_count
+    type: uint8_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: zero_cal_sum
+    type: uint64_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: zero_cal_min
+    type: uint32_t
+    restore_value: no
+    initial_value: '4294967295'
+
+  - id: zero_cal_max
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+# -----------------------------------------------------------------------------
+# Home Assistant: normal user-facing measurements
+# -----------------------------------------------------------------------------
+
+sensor:
+  - platform: template
+    id: voltage
+    name: "Voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+
+  - platform: template
+    id: current
+    name: "Current"
+    unit_of_measurement: "A"
+    device_class: current
+    state_class: measurement
+    accuracy_decimals: 3
+    update_interval: never
+
+  - platform: template
+    id: power
+    name: "Power"
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+
+  - platform: template
+    id: average_power
+    name: "Average Power"
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+
+  - platform: template
+    id: apparent_power
+    name: "Apparent Power"
+    unit_of_measurement: "VA"
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+
+  - platform: template
+    id: power_factor
+    name: "Power Factor"
+    state_class: measurement
+    accuracy_decimals: 2
+    update_interval: never
+
+  - platform: template
+    id: energy
+    name: "Energy"
+    unit_of_measurement: "kWh"
+    device_class: energy
+    state_class: total_increasing
+    accuracy_decimals: 4
+    update_interval: never
+
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    update_interval: 60s
+    accuracy_decimals: 0
+    entity_category: diagnostic
+
+  - platform: uptime
+    name: "Uptime"
+    update_interval: 60s
+    entity_category: diagnostic
+
+  # Current zero as an equivalent ampere offset. Web-only service information.
+  - platform: template
+    id: current_zero_offset
+    name: "Calibration - Current Zero Offset"
+    internal: true
+    unit_of_measurement: "A"
+    accuracy_decimals: 4
+    update_interval: never
+
+  # ---------------------------------------------------------------------------
+  # Local web UI only: diagnostics / service data
+  # ---------------------------------------------------------------------------
+
+  - platform: template
+    id: raw_h
+    name: "Diagnostic - Raw H"
+    internal: true
+    accuracy_decimals: 0
+    update_interval: never
+
+  - platform: template
+    id: raw_i
+    name: "Diagnostic - Raw I"
+    internal: true
+    accuracy_decimals: 0
+    update_interval: never
+
+  - platform: template
+    id: raw_w
+    name: "Diagnostic - Raw W"
+    internal: true
+    accuracy_decimals: 0
+    update_interval: never
+
+  - platform: template
+    id: raw_v
+    name: "Diagnostic - Raw V"
+    internal: true
+    accuracy_decimals: 0
+    update_interval: never
+
+  - platform: template
+    id: energy_calibration_run
+    name: "Calibration - Energy Run (Uncalibrated)"
+    internal: true
+    unit_of_measurement: "kWh"
+    accuracy_decimals: 4
+    update_interval: never
+
+text_sensor:
+  - platform: template
+    id: reset_reason
+    name: "Reset Reason"
+    entity_category: diagnostic
+    update_interval: never
+
+  - platform: template
+    id: frame_status
+    name: "Diagnostic - Frame Status"
+    internal: true
+    update_interval: never
+
+  - platform: template
+    id: raw_frame
+    name: "Diagnostic - Raw Frame"
+    internal: true
+    update_interval: never
+
+  - platform: template
+    id: zero_calibration_status
+    name: "Calibration - Zero Status"
+    internal: true
+    update_interval: never
+
+  - platform: template
+    id: calibration_status
+    name: "Calibration - Status"
+    internal: true
+    update_interval: never
+
+# -----------------------------------------------------------------------------
+# Local web UI only: reference-value calibration inputs
+# -----------------------------------------------------------------------------
+
+number:
+  - platform: template
+    id: reference_voltage
+    name: "Calibration - Voltage Reference"
+    internal: true
+    unit_of_measurement: "V"
+    optimistic: true
+    restore_value: false
+    initial_value: 120.0
+    min_value: 80.0
+    max_value: 140.0
+    step: 0.1
+    mode: box
+
+  - platform: template
+    id: reference_current
+    name: "Calibration - Current Reference"
+    internal: true
+    unit_of_measurement: "A"
+    optimistic: true
+    restore_value: false
+    initial_value: 1.000
+    min_value: 0.010
+    max_value: 20.000
+    step: 0.001
+    mode: box
+
+  - platform: template
+    id: reference_power
+    name: "Calibration - Power Reference"
+    internal: true
+    unit_of_measurement: "W"
+    optimistic: true
+    restore_value: false
+    initial_value: 100.0
+    min_value: 1.0
+    max_value: 2000.0
+    step: 0.1
+    mode: box
+
+  - platform: template
+    id: reference_energy
+    name: "Calibration - Energy Reference"
+    internal: true
+    unit_of_measurement: "kWh"
+    optimistic: true
+    restore_value: false
+    initial_value: 0.100
+    min_value: 0.001
+    max_value: 10.000
+    step: 0.001
+    mode: box
+
+# -----------------------------------------------------------------------------
+# Local web UI only: service / calibration actions
+# -----------------------------------------------------------------------------
+
+button:
+  - platform: template
+    id: start_wifi_setup_button
+    name: "Start Wi-Fi Setup AP"
+    internal: true
+    on_press:
+      - script.execute: start_wifi_setup_ap
+
+  - platform: template
+    id: calibrate_zero_button
+    name: "Calibration - Zero Calibrate"
+    internal: true
+    on_press:
+      - if:
+          condition:
+            switch.is_off: outlet_relay
+          then:
+            - lambda: |-
+                id(zero_cal_pending) = true;
+                id(zero_cal_count) = 0;
+                id(zero_cal_sum) = 0;
+                id(zero_cal_min) = 0xFFFFFFFFUL;
+                id(zero_cal_max) = 0;
+                id(zero_calibration_status).publish_state("Collecting zero: 0/5 valid frames");
+                ESP_LOGI("wion", "Zero calibration started: collecting 5 valid no-load frames");
+          else:
+            - text_sensor.template.publish:
+                id: zero_calibration_status
+                state: "Outlet must be OFF"
+
+  - platform: template
+    name: "Calibration - Voltage Calibrate"
+    internal: true
+    on_press:
+      - lambda: |-
+          const double measured = id(voltage).state;
+          if (!isnan(measured) && measured > 1.0) {
+            id(voltage_gain) *= (double) id(reference_voltage).state / measured;
+            char msg[96];
+            snprintf(msg, sizeof(msg), "Voltage: %.2f -> %.2f V, gain=%.6f",
+                     measured, (double) id(reference_voltage).state, id(voltage_gain));
+            id(calibration_status).publish_state(msg);
+            ESP_LOGI("wion.cal", "%s", msg);
+          } else {
+            id(calibration_status).publish_state("Voltage calibration failed: no valid measurement");
+          }
+
+  - platform: template
+    name: "Calibration - Current Calibrate"
+    internal: true
+    on_press:
+      - lambda: |-
+          const double measured = id(current).state;
+          if (id(outlet_relay).state &&
+              !isnan(measured) &&
+              measured > 0.01) {
+            id(current_gain) *= (double) id(reference_current).state / measured;
+            char msg[96];
+            snprintf(msg, sizeof(msg), "Current: %.4f -> %.4f A, gain=%.6f",
+                     measured, (double) id(reference_current).state, id(current_gain));
+            id(calibration_status).publish_state(msg);
+            ESP_LOGI("wion.cal", "%s", msg);
+          } else {
+            id(calibration_status).publish_state("Current calibration failed: apply a load first");
+          }
+
+  - platform: template
+    name: "Calibration - Power Calibrate"
+    internal: true
+    on_press:
+      - lambda: |-
+          const double measured = id(power).state;
+          if (id(outlet_relay).state &&
+              !isnan(measured) &&
+              measured > 1.0) {
+            id(power_gain) *= (double) id(reference_power).state / measured;
+            char msg[96];
+            snprintf(msg, sizeof(msg), "Power: %.2f -> %.2f W, gain=%.6f",
+                     measured, (double) id(reference_power).state, id(power_gain));
+            id(calibration_status).publish_state(msg);
+            ESP_LOGI("wion.cal", "%s", msg);
+          } else {
+            id(calibration_status).publish_state("Power calibration failed: apply a load first");
+          }
+
+  - platform: template
+    name: "Calibration - Energy Reset Run"
+    internal: true
+    on_press:
+      - lambda: |-
+          id(energy_cal_raw) = 0;
+          id(energy_calibration_run).publish_state(0.0f);
+          id(calibration_status).publish_state("Energy calibration run reset");
+
+  - platform: template
+    name: "Calibration - Energy Calibrate"
+    internal: true
+    on_press:
+      - lambda: |-
+          constexpr double HW_OFFSET = 87047252.0;
+          const double uncal =
+              ((double) id(energy_cal_raw) * 100.0 / HW_OFFSET);
+
+          if (uncal > 0.001) {
+            id(energy_gain) = (double) id(reference_energy).state / uncal;
+
+            // Avoid an artificial upward jump in the HA total_increasing
+            // counter when the gain changes: begin a new boot-cycle total.
+            id(energy_total_raw) = 0;
+            id(energy_cal_raw) = 0;
+            id(average_power_raw) = 0;
+            id(average_power_window_start_ms) = millis();
+            id(energy).publish_state(0.0f);
+            id(average_power).publish_state(NAN);
+            id(energy_calibration_run).publish_state(0.0f);
+
+            char msg[112];
+            snprintf(msg, sizeof(msg), "Energy: %.5f -> %.5f kWh, gain=%.6f",
+                     uncal, (double) id(reference_energy).state, id(energy_gain));
+            id(calibration_status).publish_state(msg);
+            ESP_LOGI("wion.cal", "%s", msg);
+          } else {
+            id(calibration_status).publish_state("Energy calibration failed: accumulate >0.001 kWh first");
+          }
+
+  - platform: template
+    name: "Calibration - Reset Defaults"
+    internal: true
+    on_press:
+      - lambda: |-
+          id(voltage_gain) = 1.0;
+          id(current_gain) = 1.041415;
+          id(power_gain) = 1.031;
+          id(energy_gain) = 1.138468;
+
+          // Known-good no-load floor measured on this exact plug.
+          id(current_zero_raw) = 443876;
+          id(zero_cal_pending) = false;
+
+          id(average_power_raw) = 0;
+          id(average_power_window_start_ms) = millis();
+          id(average_power).publish_state(NAN);
+
+          id(zero_calibration_status).publish_state("Default Raw I0=443876 restored");
+          id(calibration_status).publish_state("Calibration reset to WiOn 50055 defaults");
+          ESP_LOGI("wion.cal",
+                   "Defaults restored: V=1.000000 I=1.041415 P=1.031000 E=1.138468 RawI0=443876");
+
+# -----------------------------------------------------------------------------
+# Stock bridge reader
+# -----------------------------------------------------------------------------
+
+interval:
+  - interval: 5s
+    then:
+      - lambda: |-
+          constexpr double HW_OFFSET = 87047252.0;
+          constexpr double A_OFFSET  =   138542.0;
+          constexpr double W_OFFSET  =   223210.0;
+          constexpr double V_OFFSET  =   308756.0;
+
+          const WionPowerFrame f = wion_read_power_frame();
+
+          char packet[64];
+          snprintf(packet, sizeof(packet), "%08lX %08lX %08lX %08lX",
+                   (unsigned long) f.words[0],
+                   (unsigned long) f.words[1],
+                   (unsigned long) f.words[2],
+                   (unsigned long) f.words[3]);
+
+          if (!f.valid) {
+            const bool all_ff =
+                f.words[0] == 0xFFFFFFFFUL &&
+                f.words[1] == 0xFFFFFFFFUL &&
+                f.words[2] == 0xFFFFFFFFUL &&
+                f.words[3] == 0xFFFFFFFFUL;
+
+            if (!all_ff) {
+              id(frame_status).publish_state("BAD TAGS");
+              id(raw_frame).publish_state(packet);
+              ESP_LOGW("wion", "Bad frame: %s", packet);
+            } else {
+              ESP_LOGV("wion", "Bridge not ready; keeping previous values");
+            }
+            return;
+          }
+
+          id(frame_status).publish_state("OK");
+          id(raw_frame).publish_state(packet);
+          id(raw_h).publish_state((float) f.h);
+          id(raw_i).publish_state((float) f.i);
+          id(raw_w).publish_state((float) f.w);
+          id(raw_v).publish_state((float) f.v);
+
+          double factory_v = NAN;
+          double factory_a = NAN;
+          double factory_w = NAN;
+
+          if (f.v >= 1089 && f.v <= 6535)
+            factory_v = 100000000000.0 / ((double) f.v * V_OFFSET);
+
+          if (f.i == 0)
+            factory_a = 0.0;
+          else if (f.i >= 362)
+            factory_a = 1000000000.0 / ((double) f.i * A_OFFSET);
+
+          if (f.w == 0)
+            factory_w = 0.0;
+          else if (f.w >= 1723)
+            factory_w = 1000000000000.0 / ((double) f.w * W_OFFSET);
+
+          // Zero calibration: five valid no-load frames, trimmed mean.
+          if (id(zero_cal_pending)) {
+            if (id(outlet_relay).state) {
+              id(zero_cal_pending) = false;
+              id(zero_calibration_status).publish_state("Cancelled: outlet is ON");
+            } else if (f.i > 0 && f.w == 0) {
+              id(zero_cal_sum) += (uint64_t) f.i;
+              if (f.i < id(zero_cal_min))
+                id(zero_cal_min) = f.i;
+              if (f.i > id(zero_cal_max))
+                id(zero_cal_max) = f.i;
+              id(zero_cal_count)++;
+
+              char progress[48];
+              snprintf(progress, sizeof(progress), "Collecting zero: %u/5 valid frames",
+                       (unsigned) id(zero_cal_count));
+              id(zero_calibration_status).publish_state(progress);
+
+              if (id(zero_cal_count) >= 5) {
+                const uint64_t trimmed_sum =
+                    id(zero_cal_sum) -
+                    (uint64_t) id(zero_cal_min) -
+                    (uint64_t) id(zero_cal_max);
+                const uint32_t raw_zero = (uint32_t) (trimmed_sum / 3ULL);
+
+                id(current_zero_raw) = raw_zero;
+                id(zero_cal_pending) = false;
+
+                const double zero_a =
+                    1000000000.0 / ((double) raw_zero * A_OFFSET);
+
+                char msg[80];
+                snprintf(msg, sizeof(msg), "OK: Raw I0=%lu (I0=%.4f A offset)",
+                         (unsigned long) raw_zero, zero_a);
+                id(zero_calibration_status).publish_state(msg);
+                ESP_LOGI("wion", "Zero calibrated: raw=%lu offset=%.6f A",
+                         (unsigned long) raw_zero, zero_a);
+              }
+            }
+          }
+
+          float volts = NAN;
+          if (!isnan(factory_v))
+            volts = (float) (factory_v * id(voltage_gain));
+
+          float amps = NAN;
+          double zero_a = 0.0;
+
+          if (id(current_zero_raw) > 0) {
+            zero_a =
+                1000000000.0 /
+                ((double) id(current_zero_raw) * A_OFFSET);
+          }
+          id(current_zero_offset).publish_state((float) zero_a);
+
+          if (!isnan(factory_a)) {
+            if (!id(outlet_relay).state) {
+              // With the relay physically open there cannot be an outlet load.
+              amps = 0.0f;
+            } else {
+              double corrected_a =
+                  (factory_a - zero_a) * id(current_gain);
+
+              // Only mathematical underflow/noise below the calibrated zero is
+              // clipped. There is no deadband or hysteresis: small real loads
+              // remain visible.
+              if (corrected_a < 0.0)
+                corrected_a = 0.0;
+
+              amps = (float) corrected_a;
+            }
+          }
+
+          float watts = NAN;
+          if (!isnan(factory_w)) {
+            watts = (!id(outlet_relay).state || f.w == 0)
+                    ? 0.0f
+                    : (float) (factory_w * id(power_gain));
+          }
+
+          id(voltage).publish_state(volts);
+          id(current).publish_state(amps);
+          id(power).publish_state(watts);
+
+          float va = NAN;
+          float pf_raw = NAN;
+          float pf_display = NAN;
+
+          if (!isnan(volts) && !isnan(amps)) {
+            va = volts * amps;
+            id(apparent_power).publish_state(va);
+
+            if (va >= 5.0f && !isnan(watts)) {
+              pf_raw = watts / va;
+              pf_display = pf_raw;
+              if (pf_display < 0.0f)
+                pf_display = 0.0f;
+              if (pf_display > 1.0f)
+                pf_display = 1.0f;
+              id(power_factor).publish_state(pf_display);
+            } else {
+              id(power_factor).publish_state(NAN);
+            }
+          } else {
+            id(apparent_power).publish_state(NAN);
+            id(power_factor).publish_state(NAN);
+          }
+
+          // Energy: valid H frames only. These counters are RAM-only; nothing
+          // from Energy/Average Power is periodically written to flash.
+          id(energy_total_raw) += (uint64_t) f.h;
+          id(energy_cal_raw) += (uint64_t) f.h;
+          id(average_power_raw) += (uint64_t) f.h;
+
+          const double energy_uncal =
+              ((double) id(energy_total_raw) * 100.0 / HW_OFFSET);
+          const double energy_kwh = energy_uncal * id(energy_gain);
+          id(energy).publish_state((float) energy_kwh);
+
+          const double cal_run_uncal =
+              ((double) id(energy_cal_raw) * 100.0 / HW_OFFSET);
+          id(energy_calibration_run).publish_state((float) cal_run_uncal);
+
+          // Slow low-power channel: derive active power from the H energy
+          // increment over the ACTUAL elapsed time. This remains useful when
+          // the instantaneous W channel has already fallen to Raw W = 0.
+          const uint32_t now_ms = millis();
+
+          if (id(average_power_window_start_ms) == 0) {
+            id(average_power_window_start_ms) = now_ms;
+            id(average_power_raw) = 0;
+          } else {
+            const uint32_t elapsed_ms =
+                (uint32_t) (now_ms - id(average_power_window_start_ms));
+
+            if (elapsed_ms >= 60000U) {
+              const double window_kwh =
+                  ((double) id(average_power_raw) * 100.0 / HW_OFFSET) *
+                  id(energy_gain);
+              const double elapsed_s = (double) elapsed_ms / 1000.0;
+              const double avg_w =
+                  (elapsed_s > 0.0)
+                  ? (window_kwh * 3600000.0 / elapsed_s)
+                  : 0.0;
+
+              id(average_power).publish_state((float) avg_w);
+
+              ESP_LOGD("wion.average",
+                       "60s energy window: raw=%llu elapsed=%.1fs -> %.3f W",
+                       (unsigned long long) id(average_power_raw),
+                       elapsed_s, avg_w);
+
+              id(average_power_raw) = 0;
+              id(average_power_window_start_ms) = now_ms;
+            }
+          }
+
+          ESP_LOGD("wion.measure",
+                   "RAW H=%lu I=%lu W=%lu V=%lu | factory V=%.3f I=%.6f P=%.3f | "
+                   "final V=%.2f I=%.4f P=%.2f S=%.2f PFraw=%.4f PF=%.3f | "
+                   "gain V=%.6f I=%.6f P=%.6f E=%.6f | Energy=%.5f kWh AvgP=%.2f W",
+                   (unsigned long) f.h,
+                   (unsigned long) f.i,
+                   (unsigned long) f.w,
+                   (unsigned long) f.v,
+                   factory_v, factory_a, factory_w,
+                   volts, amps, watts, va, pf_raw, pf_display,
+                   id(voltage_gain), id(current_gain), id(power_gain), id(energy_gain),
+                   energy_kwh, id(average_power).state);
