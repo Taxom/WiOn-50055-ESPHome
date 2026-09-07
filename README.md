@@ -261,6 +261,41 @@ OTA update:
 python -m esphome upload .\wion_50055_v1.0.0.yaml --device wion-50055.local
 ```
 
+
+## Acknowledgements and prior work
+
+This project builds on substantial reverse-engineering work done by others.
+
+Special thanks to the author of:
+
+- [Woods WiOn 50055 WiFi Plug Hardware Hacking / Tasmota Installation](https://www.tarball.ca/posts/woods-wion-50055-wifi-plug-hacking/)
+
+That work provided the teardown, ESP8266 flashing pinout, GPIO mapping, PCB
+documentation, identification of the stock HLW8012 metering hardware, and an
+original factory-firmware backup. It made development of this firmware
+considerably easier.
+
+The following Home Assistant Community discussion was also especially useful:
+
+- [Decoding Power Bar with Energy Monitoring](https://community.home-assistant.io/t/decoding-power-bar-with-energy-monitoring/622841)
+
+That thread documented the stock bridge-to-ESP8266 data stream, including the
+GPIO0 clock / GPIO12 data interface and the repeating four-word measurement
+frame tagged as:
+
+- `0x48` — H / energy accumulation
+- `0x49` — current
+- `0x57` — active power
+- `0x56` — voltage
+
+It also contained early proof-of-concept work for reading the bridge protocol.
+
+This project extends that prior work by retaining the original power-monitor
+bridge, implementing its protocol in ESPHome, recovering the stock conversion
+formulas and factory calibration data, and adding calibration, Home Assistant
+integration, OTA, recovery AP, restore modes, and low-power energy-derived
+average power.
+
 ## Validation completed before v1.0.0
 
 Validated on the development unit:
