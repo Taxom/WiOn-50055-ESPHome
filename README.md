@@ -21,6 +21,15 @@ ESPHome 2026.8.2 or newer is required.
 
 > Hardware photos, PCB photos and the programming-pad pinout will be added later.
 
+### USB output power caveat
+
+The development unit was observed to reset with `Power On` as the reset reason when
+an approximately 3 A load was drawn from its USB charging output. This indicates that
+the ESP8266/control electronics are not sufficiently isolated from a heavy USB load.
+The USB output is therefore not recommended for high-current charging when reliable
+outlet operation matters. This is a stock hardware/power-distribution limitation,
+not an ESPHome reset policy.
+
 ## How the stock power-monitor bridge works
 
 The ESP8266 does **not** measure mains voltage/current directly and does not talk
@@ -46,6 +55,31 @@ The upper byte is a tag; the lower 24 bits are the measurement payload:
 
 The firmware keeps the original bridge intact and converts these raw values instead
 of bypassing the bridge or rewiring the metering section.
+
+### Bridge timing and ESP8266 Wi‑Fi stability
+
+An earlier bridge reader disabled interrupts for the entire 128-bit transaction.
+With a 35 us low phase and 35 us high phase per bit, that blocked ESP8266 interrupt
+servicing for at least:
+
+```text
+128 × (35 us + 35 us) = 8.96 ms
+```
+
+That implementation was associated with intermittent ESP8266 exceptions/watchdog
+resets and occasional local web-UI stalls during extended testing.
+
+The current `wion_power_bridge.h` intentionally leaves interrupts enabled while the
+frame is read. The ESP8266 supplies the clock on GPIO0, so a Wi‑Fi/SDK interrupt may
+stretch an individual clock phase but does not advance the bridge to the next bit.
+The reader still validates every frame by checking the expected `0x48`, `0x49`,
+`0x57`, `0x56` tags.
+
+On the development unit this change preserved valid power-monitor frames, improved
+web-UI responsiveness, and completed more than 24 hours of continuous operation
+without the unexplained exception/watchdog resets seen with the long interrupt lock.
+A deliberate power interruption during that period was separately identified by a
+`Power On` reset reason and was not a firmware crash.
 
 The stock conversion equations recovered during reverse engineering are:
 
@@ -260,7 +294,6 @@ OTA update:
 ```powershell
 python -m esphome upload .\wion_50055_v1.0.0.yaml --device wion-50055.local
 ```
-
 
 ## Acknowledgements and prior work
 
