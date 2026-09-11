@@ -43,7 +43,12 @@ static inline WionPowerFrame wion_read_power_frame() {
   // A complete frame is 128 bits. 35 us half-period is deliberately used
   // here: it is slightly slower than the ~32 us seen in the stock firmware
   // and has already been demonstrated on this hardware family.
-  noInterrupts();
+  //
+  // Do not globally disable interrupts for the whole ~9 ms transaction.
+  // ESP8266 Wi-Fi / SDK timing depends on timely interrupt servicing. Because
+  // the ESP8266 supplies the clock, an interrupt may stretch a clock phase but
+  // does not advance the bridge to the next bit. Frame validity is checked
+  // below using the four expected tags.
   for (uint8_t block = 0; block < 4; block++) {
     uint32_t value = 0;
     for (uint8_t bit = 0; bit < 32; bit++) {
@@ -59,7 +64,6 @@ static inline WionPowerFrame wion_read_power_frame() {
     }
     frame.words[block] = value;
   }
-  interrupts();
 
   digitalWrite(0, HIGH);
 
