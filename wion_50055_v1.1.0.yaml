@@ -1,0 +1,896 @@
+substitutions:
+  device_name: wion-50055
+  friendly_name: "WiOn 50055"
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  comment: "WiOn v1.1.0 firmware for Woods WiOn 50055"
+  min_version: 2026.8.2
+  includes:
+    - wion_power_bridge.h
+
+  on_boot:
+    - priority: 600
+      then:
+        - lambda: |-
+            wion_bus_setup();
+
+    # Apply the user-selected outlet startup policy only after components and
+    # restored preferences are available. The relay itself always initializes
+    # physically OFF first, preventing an early ON pulse.
+    - priority: -100
+      then:
+        - lambda: |-
+            bool desired = false;
+            if (id(startup_mode_code) == 1) {
+              desired = true;                       // Always On
+            } else if (id(startup_mode_code) == 2) {
+              desired = id(last_outlet_state);      // Restore Last State
+            }
+
+            if (desired) {
+              id(outlet_relay).turn_on();
+            } else {
+              id(outlet_relay).turn_off();
+            }
+
+            id(boot_initializing) = false;
+
+            const String rr = ESP.getResetReason();
+            const String ri = ESP.getResetInfo();
+
+            id(reset_reason).publish_state(rr.c_str());
+            id(reset_info).publish_state(ri.c_str());
+
+            ESP_LOGI("wion.boot", "Reset reason: %s", rr.c_str());
+            ESP_LOGW("wion.boot", "Reset info: %s", ri.c_str());
+
+esp8266:
+  board: esp01_1m
+  restore_from_flash: true
+
+preferences:
+  flash_write_interval: 1s
+
+logger:
+  level: DEBUG
+  baud_rate: 0
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  min_auth_mode: WPA2
+  power_save_mode: none
+  reboot_timeout: 0s
+
+  ap:
+    ssid: "WiOn-50055 Setup"
+    password: !secret fallback_ap_password
+    ap_timeout: 90s
+
+  on_connect:
+    - output.turn_on: blue_led_output
+  on_disconnect:
+    - output.turn_off: blue_led_output
+
+captive_portal:
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+  reboot_timeout: 0s
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+safe_mode:
+  num_attempts: 5
+  boot_is_good_after: 1min
+  reboot_timeout: 10min
+  storage: rtc
+
+web_server:
+  port: 80
+  version: 2
+  log: true
+  include_internal: true
+  auth:
+    type: digest
+    username: !secret web_username
+    password: !secret web_password
+
+output:
+  - platform: gpio
+    id: blue_led_output
+    pin:
+      number: GPIO2
+      inverted: true
+
+switch:
+  - platform: gpio
+    id: outlet_relay
+    name: "Outlet"
+    pin: GPIO15
+    restore_mode: ALWAYS_OFF
+
+    on_turn_on:
+      - lambda: |-
+          if (!id(boot_initializing) && id(startup_mode_code) == 2)
+            id(last_outlet_state) = true;
+
+          if (id(zero_cal_pending)) {
+            id(zero_cal_pending) = false;
+            id(zero_calibration_status).publish_state("Cancelled: outlet turned ON");
+            ESP_LOGW("wion", "Zero calibration cancelled because outlet was turned ON");
+          }
+
+    on_turn_off:
+      - lambda: |-
+          if (!id(boot_initializing) && id(startup_mode_code) == 2)
+            id(last_outlet_state) = false;
+
+  - platform: gpio
+    id: outlet_backlight
+    name: "Outlet Backlight"
+    pin: GPIO14
+    restore_mode: RESTORE_DEFAULT_OFF
+
+binary_sensor:
+  - platform: gpio
+    id: physical_button
+    name: "Physical Button"
+    internal: true
+    pin:
+      number: GPIO13
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    filters:
+      - delayed_on_off: 20ms
+
+    on_multi_click:
+      - timing:
+          - ON for at most 1s
+          - OFF for at least 50ms
+        then:
+          - switch.toggle: outlet_relay
+
+      - timing:
+          - ON for at least 30s
+        then:
+          - script.execute: start_wifi_setup_ap
+
+script:
+  - id: start_wifi_setup_ap
+    mode: restart
+    then:
+      - logger.log:
+          level: WARN
+          format: "Starting forced Wi-Fi setup AP; normal STA config will return after reboot"
+      - lambda: |-
+          auto *wifi_comp = esphome::wifi::global_wifi_component;
+          if (wifi_comp != nullptr) {
+            wifi_comp->disable();
+            wifi_comp->clear_sta();
+            wifi_comp->set_ap_timeout(0);
+            wifi_comp->enable();
+          }
+
+select:
+  - platform: template
+    id: outlet_startup_mode
+    name: "Power Restore Mode"
+    entity_category: config
+    options:
+      - "Always Off"
+      - "Always On"
+      - "Restore Last State"
+    update_interval: 30s
+    lambda: |-
+      if (id(startup_mode_code) == 1)
+        return std::string("Always On");
+      if (id(startup_mode_code) == 2)
+        return std::string("Restore Last State");
+      return std::string("Always Off");
+    set_action:
+      - lambda: |-
+          if (x == "Always On") {
+            id(startup_mode_code) = 1;
+          } else if (x == "Restore Last State") {
+            id(startup_mode_code) = 2;
+            id(last_outlet_state) = id(outlet_relay).state;
+          } else {
+            id(startup_mode_code) = 0;
+          }
+          id(outlet_startup_mode).publish_state(x);
+
+globals:
+  - id: startup_mode_code
+    type: uint8_t
+    restore_value: yes
+    initial_value: '0'
+
+  - id: last_outlet_state
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+
+  - id: boot_initializing
+    type: bool
+    restore_value: no
+    initial_value: 'true'
+
+  - id: voltage_coefficient
+    type: double
+    restore_value: yes
+    initial_value: '322499.908463'
+
+  - id: current_coefficient
+    type: double
+    restore_value: yes
+    initial_value: '7516.962365203'
+
+  - id: power_coefficient
+    type: double
+    restore_value: yes
+    initial_value: '4618968.684198736'
+
+  - id: energy_coefficient
+    type: double
+    restore_value: yes
+    initial_value: '0.000001307873567336'
+
+  - id: energy_total_raw
+    type: uint64_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: energy_cal_raw
+    type: uint64_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: average_power_raw
+    type: uint64_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: average_power_window_start_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: current_zero_raw
+    type: uint32_t
+    restore_value: yes
+    initial_value: '443876'
+
+  - id: zero_cal_pending
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: zero_cal_count
+    type: uint8_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: zero_cal_sum
+    type: uint64_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: zero_cal_min
+    type: uint32_t
+    restore_value: no
+    initial_value: '4294967295'
+
+  - id: zero_cal_max
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: filtered_raw_v
+    type: double
+    restore_value: no
+    initial_value: '0.0'
+
+  - id: filtered_raw_i
+    type: double
+    restore_value: no
+    initial_value: '0.0'
+
+  - id: filtered_raw_w
+    type: double
+    restore_value: no
+    initial_value: '0.0'
+
+  - id: filtered_voltage
+    type: double
+    restore_value: no
+    initial_value: '0.0'
+
+  - id: filtered_current
+    type: double
+    restore_value: no
+    initial_value: '0.0'
+
+  - id: filtered_power
+    type: double
+    restore_value: no
+    initial_value: '0.0'
+
+  - id: filter_sample_count
+    type: uint8_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: raw_v_history
+    type: double[5]
+    restore_value: no
+    initial_value: '{0,0,0,0,0}'
+
+  - id: raw_i_history
+    type: double[5]
+    restore_value: no
+    initial_value: '{0,0,0,0,0}'
+
+  - id: raw_w_history
+    type: double[5]
+    restore_value: no
+    initial_value: '{0,0,0,0,0}'
+
+sensor:
+  - platform: template
+    id: voltage
+    name: "Voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+
+  - platform: template
+    id: current
+    name: "Current"
+    unit_of_measurement: "A"
+    device_class: current
+    state_class: measurement
+    accuracy_decimals: 3
+    update_interval: never
+
+  - platform: template
+    id: power
+    name: "Power"
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+
+  - platform: template
+    id: average_power
+    name: "Average Power"
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+
+  - platform: template
+    id: apparent_power
+    name: "Apparent Power"
+    unit_of_measurement: "VA"
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+
+  - platform: template
+    id: power_factor
+    name: "Power Factor"
+    state_class: measurement
+    accuracy_decimals: 2
+    update_interval: never
+
+  - platform: template
+    id: energy
+    name: "Energy"
+    unit_of_measurement: "kWh"
+    device_class: energy
+    state_class: total_increasing
+    accuracy_decimals: 4
+    update_interval: never
+
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    update_interval: 60s
+    accuracy_decimals: 0
+    entity_category: diagnostic
+
+  - platform: uptime
+    name: "Uptime"
+    update_interval: 60s
+    entity_category: diagnostic
+
+  - platform: template
+    id: free_heap
+    name: "Diagnostic - Free Heap"
+    internal: true
+    unit_of_measurement: "B"
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: |-
+      return (float) ESP.getFreeHeap();
+
+  - platform: template
+    id: max_free_heap_block
+    name: "Diagnostic - Max Free Heap Block"
+    internal: true
+    unit_of_measurement: "B"
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: |-
+      return (float) ESP.getMaxFreeBlockSize();
+
+  - platform: template
+    id: heap_fragmentation
+    name: "Diagnostic - Heap Fragmentation"
+    internal: true
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: |-
+      return (float) ESP.getHeapFragmentation();
+
+  - platform: template
+    id: current_zero_raw_display
+    name: "Calibration - Current Zero Raw"
+    internal: true
+    accuracy_decimals: 0
+    update_interval: never
+
+  - platform: template
+    id: voltage_coefficient_display
+    name: "Calibration - Voltage Coefficient"
+    internal: true
+    accuracy_decimals: 6
+    update_interval: never
+
+  - platform: template
+    id: current_coefficient_display
+    name: "Calibration - Current Coefficient"
+    internal: true
+    accuracy_decimals: 6
+    update_interval: never
+
+  - platform: template
+    id: power_coefficient_display
+    name: "Calibration - Power Coefficient"
+    internal: true
+    accuracy_decimals: 6
+    update_interval: never
+
+  - platform: template
+    id: energy_coefficient_display
+    name: "Calibration - Energy Coefficient"
+    internal: true
+    accuracy_decimals: 12
+    update_interval: never
+
+  - platform: template
+    id: raw_h
+    name: "Diagnostic - Raw H"
+    internal: true
+    accuracy_decimals: 0
+    update_interval: never
+
+  - platform: template
+    id: raw_i
+    name: "Diagnostic - Raw I"
+    internal: true
+    accuracy_decimals: 0
+    update_interval: never
+
+  - platform: template
+    id: raw_w
+    name: "Diagnostic - Raw W"
+    internal: true
+    accuracy_decimals: 0
+    update_interval: never
+
+  - platform: template
+    id: raw_v
+    name: "Diagnostic - Raw V"
+    internal: true
+    accuracy_decimals: 0
+    update_interval: never
+
+  - platform: template
+    id: filtered_raw_v_display
+    name: "Diagnostic - Filtered Raw V"
+    internal: true
+    accuracy_decimals: 1
+    update_interval: never
+
+  - platform: template
+    id: filtered_raw_i_display
+    name: "Diagnostic - Filtered Raw I"
+    internal: true
+    accuracy_decimals: 1
+    update_interval: never
+
+  - platform: template
+    id: filtered_raw_w_display
+    name: "Diagnostic - Filtered Raw W"
+    internal: true
+    accuracy_decimals: 1
+    update_interval: never
+
+  - platform: template
+    id: energy_calibration_run
+    name: "Calibration - Energy Run"
+    internal: true
+    unit_of_measurement: "kWh"
+    accuracy_decimals: 4
+    update_interval: never
+
+text_sensor:
+  - platform: template
+    id: reset_reason
+    name: "Reset Reason"
+    entity_category: diagnostic
+    update_interval: never
+
+  - platform: template
+    id: reset_info
+    name: "Diagnostic - Reset Info"
+    internal: true
+    update_interval: never
+
+  - platform: template
+    id: frame_status
+    name: "Diagnostic - Frame Status"
+    internal: true
+    update_interval: never
+
+  - platform: template
+    id: raw_frame
+    name: "Diagnostic - Raw Frame"
+    internal: true
+    update_interval: never
+
+  - platform: template
+    id: zero_calibration_status
+    name: "Calibration - Zero Status"
+    internal: true
+    update_interval: never
+
+  - platform: template
+    id: calibration_status
+    name: "Calibration - Status"
+    internal: true
+    update_interval: never
+
+number:
+  - platform: template
+    id: reference_voltage
+    name: "Calibration - Voltage Reference"
+    internal: true
+    unit_of_measurement: "V"
+    optimistic: true
+    restore_value: false
+    initial_value: 120.0
+    min_value: 80.0
+    max_value: 140.0
+    step: 0.1
+    mode: box
+
+  - platform: template
+    id: reference_current
+    name: "Calibration - Current Reference"
+    internal: true
+    unit_of_measurement: "A"
+    optimistic: true
+    restore_value: false
+    initial_value: 1.000
+    min_value: 0.010
+    max_value: 20.000
+    step: 0.001
+    mode: box
+
+  - platform: template
+    id: reference_power
+    name: "Calibration - Power Reference"
+    internal: true
+    unit_of_measurement: "W"
+    optimistic: true
+    restore_value: false
+    initial_value: 100.0
+    min_value: 1.0
+    max_value: 2000.0
+    step: 0.1
+    mode: box
+
+  - platform: template
+    id: reference_energy
+    name: "Calibration - Energy Reference"
+    internal: true
+    unit_of_measurement: "kWh"
+    optimistic: true
+    restore_value: false
+    initial_value: 0.100
+    min_value: 0.001
+    max_value: 10.000
+    step: 0.001
+    mode: box
+
+button:
+  - platform: template
+    id: start_wifi_setup_button
+    name: "Start Wi-Fi Setup AP"
+    internal: true
+    on_press:
+      - script.execute: start_wifi_setup_ap
+
+  - platform: template
+    id: calibrate_zero_button
+    name: "Calibration - Zero Calibrate"
+    internal: true
+    on_press:
+      - if:
+          condition:
+            switch.is_off: outlet_relay
+          then:
+            - lambda: |-
+                id(zero_cal_pending) = true;
+                id(zero_cal_count) = 0;
+                id(zero_cal_sum) = 0;
+                id(zero_cal_min) = 0xFFFFFFFFUL;
+                id(zero_cal_max) = 0;
+                id(zero_calibration_status).publish_state("Collecting zero: 0/5 valid frames");
+          else:
+            - text_sensor.template.publish:
+                id: zero_calibration_status
+                state: "Outlet must be OFF"
+
+  - platform: template
+    id: calibrate_voltage_button
+    name: "Calibration - Voltage Calibrate"
+    internal: true
+    on_press:
+      - lambda: |-
+          const float ref = id(reference_voltage).state;
+          if (isnan(ref) || ref <= 0.0f || id(filtered_raw_v) <= 0.0) {
+            id(calibration_status).publish_state("Voltage calibration failed");
+            return;
+          }
+          id(voltage_coefficient) = (double) ref * id(filtered_raw_v);
+          id(calibration_status).publish_state("Voltage calibrated");
+
+  - platform: template
+    id: calibrate_current_button
+    name: "Calibration - Current Calibrate"
+    internal: true
+    on_press:
+      - lambda: |-
+          const float ref = id(reference_current).state;
+          const double raw_i = id(filtered_raw_i);
+          const double raw_zero = (double) id(current_zero_raw);
+          const double denom = (1.0 / raw_i) - (1.0 / raw_zero);
+          if (isnan(ref) || ref <= 0.0f || raw_i <= 0.0 || raw_zero <= 0.0 || denom <= 0.0) {
+            id(calibration_status).publish_state("Current calibration failed");
+            return;
+          }
+          id(current_coefficient) = (double) ref / denom;
+          id(calibration_status).publish_state("Current calibrated");
+
+  - platform: template
+    id: calibrate_power_button
+    name: "Calibration - Power Calibrate"
+    internal: true
+    on_press:
+      - lambda: |-
+          const float ref = id(reference_power).state;
+          if (isnan(ref) || ref <= 0.0f || id(filtered_raw_w) <= 0.0) {
+            id(calibration_status).publish_state("Power calibration failed");
+            return;
+          }
+          id(power_coefficient) = (double) ref * id(filtered_raw_w);
+          id(calibration_status).publish_state("Power calibrated");
+
+  - platform: template
+    id: reset_energy_calibration_button
+    name: "Calibration - Energy Reset Run"
+    internal: true
+    on_press:
+      - lambda: |-
+          id(energy_cal_raw) = 0;
+          id(energy_calibration_run).publish_state(0.0f);
+          id(calibration_status).publish_state("Energy calibration run reset");
+
+  - platform: template
+    id: calibrate_energy_button
+    name: "Calibration - Energy Calibrate"
+    internal: true
+    on_press:
+      - lambda: |-
+          const float ref = id(reference_energy).state;
+          if (isnan(ref) || ref <= 0.0f || id(energy_cal_raw) == 0) {
+            id(calibration_status).publish_state("Energy calibration failed");
+            return;
+          }
+          id(energy_coefficient) = (double) ref / (double) id(energy_cal_raw);
+          id(calibration_status).publish_state("Energy calibrated");
+
+  - platform: template
+    id: reset_calibration_button
+    name: "Calibration - Reset Defaults"
+    internal: true
+    on_press:
+      - lambda: |-
+          id(voltage_coefficient) = 322499.908463;
+          id(current_coefficient) = 7516.962365203;
+          id(power_coefficient) = 4618968.684198736;
+          id(energy_coefficient) = 0.000001307873567336;
+          id(current_zero_raw) = 443876;
+          id(calibration_status).publish_state("Calibration reset to reference defaults");
+
+interval:
+  - interval: 5s
+    then:
+      - lambda: |-
+          WionPowerFrame f = wion_read_power_frame();
+
+          char frame_buf[128];
+          snprintf(frame_buf, sizeof(frame_buf),
+                   "%08lX %08lX %08lX %08lX",
+                   (unsigned long) f.words[0],
+                   (unsigned long) f.words[1],
+                   (unsigned long) f.words[2],
+                   (unsigned long) f.words[3]);
+          id(raw_frame).publish_state(frame_buf);
+
+          if (!f.valid) {
+            id(frame_status).publish_state("INVALID");
+            return;
+          }
+
+          id(frame_status).publish_state("OK");
+          id(raw_h).publish_state((float) f.h);
+          id(raw_i).publish_state((float) f.i);
+          id(raw_w).publish_state((float) f.w);
+          id(raw_v).publish_state((float) f.v);
+
+          // Direct raw-domain conversion.
+          // Guard thresholds are retained from the verified bridge behavior.
+          double volts = NAN;
+          double amps = NAN;
+          double watts = NAN;
+
+          if (f.v >= 1000)
+            volts = id(voltage_coefficient) / (double) f.v;
+
+          if (!id(outlet_relay).state) {
+            amps = 0.0;
+            watts = 0.0;
+          } else {
+            if (f.i >= 362 && id(current_zero_raw) > 0) {
+              amps = id(current_coefficient) *
+                     ((1.0 / (double) f.i) -
+                      (1.0 / (double) id(current_zero_raw)));
+              if (amps < 0.0)
+                amps = 0.0;
+            }
+
+            if (f.w >= 1723)
+              watts = id(power_coefficient) / (double) f.w;
+            else if (f.w == 0)
+              watts = 0.0;
+          }
+
+          id(voltage).publish_state((float) volts);
+          id(current).publish_state((float) amps);
+          id(power).publish_state((float) watts);
+
+          id(filtered_raw_v) = (double) f.v;
+          id(filtered_raw_i) = (double) f.i;
+          id(filtered_raw_w) = (double) f.w;
+          id(filtered_voltage) = volts;
+          id(filtered_current) = amps;
+          id(filtered_power) = watts;
+          id(filter_sample_count) = 1;
+
+          id(filtered_raw_v_display).publish_state((float) id(filtered_raw_v));
+          id(filtered_raw_i_display).publish_state((float) id(filtered_raw_i));
+          id(filtered_raw_w_display).publish_state((float) id(filtered_raw_w));
+
+          if (id(zero_cal_pending) && !id(outlet_relay).state) {
+            id(zero_cal_sum) += (uint64_t) f.i;
+            if (f.i < id(zero_cal_min))
+              id(zero_cal_min) = f.i;
+            if (f.i > id(zero_cal_max))
+              id(zero_cal_max) = f.i;
+            id(zero_cal_count)++;
+
+            char status_buf[64];
+            snprintf(status_buf, sizeof(status_buf),
+                     "Collecting zero: %u/5 valid frames",
+                     (unsigned) id(zero_cal_count));
+            id(zero_calibration_status).publish_state(status_buf);
+
+            if (id(zero_cal_count) >= 5) {
+              const uint32_t spread = id(zero_cal_max) - id(zero_cal_min);
+              const uint32_t average =
+                  (uint32_t) (id(zero_cal_sum) / id(zero_cal_count));
+
+              if (spread <= 50000UL) {
+                id(current_zero_raw) = average;
+                id(current_zero_raw_display).publish_state((float) average);
+                id(zero_calibration_status).publish_state("Zero calibrated");
+              } else {
+                id(zero_calibration_status).publish_state("Zero unstable; retry");
+              }
+
+              id(zero_cal_pending) = false;
+            }
+          }
+
+          id(current_zero_raw_display).publish_state((float) id(current_zero_raw));
+          id(voltage_coefficient_display).publish_state((float) id(voltage_coefficient));
+          id(current_coefficient_display).publish_state((float) id(current_coefficient));
+          id(power_coefficient_display).publish_state((float) id(power_coefficient));
+          id(energy_coefficient_display).publish_state((float) id(energy_coefficient));
+
+          float va = NAN;
+          float pf = NAN;
+          if (!isnan(volts) && !isnan(amps)) {
+            va = volts * amps;
+            if (va >= 5.0f && !isnan(watts)) {
+              pf = watts / va;
+              if (pf < 0.0f)
+                pf = 0.0f;
+              if (pf > 1.0f)
+                pf = 1.0f;
+            }
+          }
+
+          id(apparent_power).publish_state(va);
+          id(power_factor).publish_state(pf);
+
+          id(energy_total_raw) += (uint64_t) f.h;
+          id(energy_cal_raw) += (uint64_t) f.h;
+          id(average_power_raw) += (uint64_t) f.h;
+
+          const double energy_kwh =
+              (double) id(energy_total_raw) * id(energy_coefficient);
+          id(energy).publish_state((float) energy_kwh);
+
+          const double calibration_run_kwh =
+              (double) id(energy_cal_raw) * id(energy_coefficient);
+          id(energy_calibration_run).publish_state((float) calibration_run_kwh);
+
+          const uint32_t now_ms = millis();
+          if (id(average_power_window_start_ms) == 0) {
+            id(average_power_window_start_ms) = now_ms;
+            id(average_power_raw) = 0;
+          } else {
+            const uint32_t elapsed_ms =
+                (uint32_t) (now_ms - id(average_power_window_start_ms));
+
+            if (elapsed_ms >= 60000U) {
+              const double window_kwh =
+                  (double) id(average_power_raw) * id(energy_coefficient);
+              const double elapsed_s = (double) elapsed_ms / 1000.0;
+              const double avg_w =
+                  (elapsed_s > 0.0)
+                  ? (window_kwh * 3600000.0 / elapsed_s)
+                  : 0.0;
+
+              id(average_power).publish_state((float) avg_w);
+              id(average_power_raw) = 0;
+              id(average_power_window_start_ms) = now_ms;
+            }
+          }
